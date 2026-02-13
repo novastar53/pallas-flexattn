@@ -278,65 +278,49 @@ def run_benchmark(
     print("Backward Pass:")
     print("-" * 40)
 
-    # Reference backward
+    # Reference backward - use vjp for fair comparison
     if not skip_reference:
-        def loss_ref(q, k, v):
-            out = mha_reference(q, k, v, mask_mod)
-            return jnp.sum(out * do)
-
-        grad_fn_ref = jax.grad(loss_ref, argnums=(0, 1, 2))
-        _ = grad_fn_ref(q, k, v)
-        t_ref_bwd = benchmark(grad_fn_ref, q, k, v, warmup=warmup, iters=iters)
+        _, ref_vjp = jax.vjp(lambda q, k, v: mha_reference(q, k, v, mask_mod), q, k, v)
+        _ = ref_vjp(do)
+        t_ref_bwd = benchmark(lambda: ref_vjp(do), warmup=warmup, iters=iters)
         results["backward"]["reference"] = t_ref_bwd
         print(f"  Reference (materialized):  {t_ref_bwd:8.3f} ms")
     else:
         print(f"  Reference (materialized):  skipped (T={T} too large)")
 
-    # cuDNN backward
+    # cuDNN backward - use vjp for fair comparison
     cudnn_result = cudnn_fwd(q, k, v)
     if cudnn_result is not None:
-        def loss_cudnn(q, k, v):
-            out = cudnn_attention_wrapper(q, k, v, is_causal=True)
-            return jnp.sum(out * do)
-
-        grad_fn_cudnn = jax.grad(loss_cudnn, argnums=(0, 1, 2))
-        _ = grad_fn_cudnn(q, k, v)
-        t_cudnn_bwd = benchmark(grad_fn_cudnn, q, k, v, warmup=warmup, iters=iters)
+        _, cudnn_vjp = jax.vjp(lambda q, k, v: cudnn_attention_wrapper(q, k, v, is_causal=True), q, k, v)
+        _ = cudnn_vjp(do)
+        t_cudnn_bwd = benchmark(lambda: cudnn_vjp(do), warmup=warmup, iters=iters)
         results["backward"]["cudnn"] = t_cudnn_bwd
         print(f"  JAX cuDNN attention:       {t_cudnn_bwd:8.3f} ms")
     else:
         print(f"  JAX cuDNN attention:       not available (no GPU/CUDA)")
 
-    # flash_attn_jax backward
+    # flash_attn_jax backward - use vjp for fair comparison
     if HAS_FLASH_ATTN_JAX:
-        def loss_flash_jax(q, k, v):
-            out = flash_attn_jax_wrapper(q, k, v, is_causal=True)
-            return jnp.sum(out * do)
-
-        grad_fn_flash_jax = jax.grad(loss_flash_jax, argnums=(0, 1, 2))
-        _ = grad_fn_flash_jax(q, k, v)
-        t_flash_jax_bwd = benchmark(grad_fn_flash_jax, q, k, v, warmup=warmup, iters=iters)
+        _, flash_jax_vjp = jax.vjp(lambda q, k, v: flash_attn_jax_wrapper(q, k, v, is_causal=True), q, k, v)
+        _ = flash_jax_vjp(do)
+        t_flash_jax_bwd = benchmark(lambda: flash_jax_vjp(do), warmup=warmup, iters=iters)
         results["backward"]["flash_attn_jax"] = t_flash_jax_bwd
         print(f"  flash_attn_jax (C++):      {t_flash_jax_bwd:8.3f} ms")
     else:
         print(f"  flash_attn_jax (C++):      not installed")
 
-    # Our backward
-    def loss_our(q, k, v):
-        out = flash_attention(
-            q, k, v,
-            mask_mod=mask_mod,
-            block_r=block_r,
-            block_c=block_c,
-            num_warps=num_warps,
-            num_stages=num_stages,
-            interpret=interpret,
-        )
-        return jnp.sum(out * do)
-
-    grad_fn_our = jax.grad(loss_our, argnums=(0, 1, 2))
-    _ = grad_fn_our(q, k, v)
-    t_our_bwd = benchmark(grad_fn_our, q, k, v, warmup=warmup, iters=iters)
+    # Our backward - use vjp for fair comparison (only backward pass, not forward+backward)
+    _, our_vjp = jax.vjp(lambda q, k, v: flash_attention(
+        q, k, v,
+        mask_mod=mask_mod,
+        block_r=block_r,
+        block_c=block_c,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        interpret=interpret,
+    ), q, k, v)
+    _ = our_vjp(do)
+    t_our_bwd = benchmark(lambda: our_vjp(do), warmup=warmup, iters=iters)
     results["backward"]["pallas_flexattn"] = t_our_bwd
     print(f"  Pallas FlexAttention:      {t_our_bwd:8.3f} ms")
     print()
