@@ -18,6 +18,14 @@ from pallas_flexattn.block_mask import (
     create_causal_block_mask,
     create_sliding_window_block_mask,
 )
+from pallas_flexattn.kernel_tuner import (
+    get_optimal_params,
+    get_kernel_config,
+    print_kernel_config,
+)
+
+# Benchmark functions (available but not imported by default to avoid heavy dependencies)
+# from pallas_flexattn.benchmark import run_benchmark, benchmark
 
 __all__ = [
     "flash_attention",
@@ -32,4 +40,7 @@ __all__ = [
     "create_block_mask",
     "create_causal_block_mask",
     "create_sliding_window_block_mask",
+    "get_optimal_params",
+    "get_kernel_config",
+    "print_kernel_config",
 ]
