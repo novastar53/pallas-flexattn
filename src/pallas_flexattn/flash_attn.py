@@ -20,6 +20,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
+from pallas_flexattn.mask_mod import MaskMod, causal_mask
+
 # Default kernel configuration
 DEFAULT_BLOCK_R = 64
 DEFAULT_BLOCK_C = 64
@@ -27,13 +29,12 @@ DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 3
 
 
-@partial(jax.jit, static_argnums=(3, 4))
+@partial(jax.jit, static_argnums=(3,))
 def mha_reference(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    causal: bool = True,
-    window_size: Optional[Tuple[int, int]] = None,
+    mask_mod: Optional[MaskMod] = None,
 ) -> jax.Array:
     """Reference multi-head attention (materializes N×N matrix).
 
@@ -44,18 +45,10 @@ def mha_reference(
     logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) / math.sqrt(d)
     T = q.shape[2]
 
-    if causal:
-        mask = jnp.arange(T)[:, None] >= jnp.arange(T)[None, :]
-        logits = jnp.where(mask, logits, -jnp.inf)
-    elif window_size is not None:
-        left, right = window_size
-        q_idx = jnp.arange(T)
-        k_idx = jnp.arange(T)
-        mask = jnp.ones((T, T), dtype=jnp.bool_)
-        if left >= 0:
-            mask = mask & (q_idx[:, None] - left <= k_idx[None, :])
-        if right >= 0:
-            mask = mask & (q_idx[:, None] + right >= k_idx[None, :])
+    if mask_mod is not None:
+        q_idx = jnp.arange(T)[:, None]
+        kv_idx = jnp.arange(T)[None, :]
+        mask = mask_mod(q_idx, kv_idx)
         logits = jnp.where(mask, logits, -jnp.inf)
 
     probs = jax.nn.softmax(logits, axis=-1)
@@ -68,8 +61,7 @@ def flash_attention_fwd_kernel(
     num_k_blocks: int,
     block_r: int,
     block_c: int,
-    causal: bool,
-    window_size: Optional[Tuple[int, int]],
+    mask_mod: Optional[MaskMod],
 ):
     """Flash attention forward kernel."""
     q_reg = plgpu.load(q_ref.at[0, :, :])
@@ -89,18 +81,9 @@ def flash_attention_fwd_kernel(
         def compute_block(_):
             s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
 
-            if causal:
+            if mask_mod is not None:
                 kv_idx = block_c * t + jnp.arange(block_c)
-                causal_mask = kv_idx[None, :] > q_idx[:, None]
-                s_blk = jnp.where(causal_mask, -jnp.inf, s_blk)
-            elif window_size is not None:
-                left, right = window_size
-                kv_idx = block_c * t + jnp.arange(block_c)
-                mask = jnp.ones((block_r, block_c), dtype=jnp.bool_)
-                if left >= 0:
-                    mask = mask & (q_idx[:, None] - left <= kv_idx[None, :])
-                if right >= 0:
-                    mask = mask & (q_idx[:, None] + right >= kv_idx[None, :])
+                mask = mask_mod(q_idx[:, None], kv_idx[None, :])
                 s_blk = jnp.where(mask, s_blk, -jnp.inf)
 
             max_blk = jnp.maximum(max_reg, jnp.max(s_blk, axis=-1))
@@ -114,19 +97,8 @@ def flash_attention_fwd_kernel(
                     l_reg * alpha + l_blk,
                     o_reg * alpha[:, None] + o_blk)
 
-        def skip_block(_):
-            return (max_reg, l_reg, o_reg)
-
-        # Skip blocks entirely outside the attention window
-        if causal:
-            return jax.lax.cond(t > blk_idx, skip_block, compute_block, None)
-        elif window_size is not None:
-            left, right = window_size
-            skip_right = t * block_c > blk_idx * block_r + (block_r - 1) + right
-            skip_left = (t + 1) * block_c - 1 < blk_idx * block_r - left
-            return jax.lax.cond(skip_right | skip_left, skip_block, compute_block, None)
-        else:
-            return compute_block(None)
+        # TODO: Add block skipping optimization for causal masks using BlockMask
+        return compute_block(None)
 
     max_reg, l_reg, o_reg = jax.lax.fori_loop(0, num_k_blocks, body, (max_reg, l_reg, o_reg))
     logsumexp_reg = max_reg + jnp.log(l_reg)
@@ -135,13 +107,12 @@ def flash_attention_fwd_kernel(
     plgpu.store(logsumexp_ref.at[0, :], logsumexp_reg.astype(logsumexp_ref.dtype))
 
 
-@partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8, 9))
+@partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8))
 def flash_attention_fwd(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    causal: bool = True,
-    window_size: Optional[Tuple[int, int]] = None,
+    mask_mod: Optional[MaskMod] = None,
     block_r: int = DEFAULT_BLOCK_R,
     block_c: int = DEFAULT_BLOCK_C,
     num_warps: int = DEFAULT_NUM_WARPS,
@@ -165,8 +136,7 @@ def flash_attention_fwd(
             num_k_blocks=num_k_blocks,
             block_r=block_r,
             block_c=block_c,
-            causal=causal,
-            window_size=window_size,
+            mask_mod=mask_mod,
         ),
         out_shape=[
             jax.ShapeDtypeStruct(q_flat.shape, q_flat.dtype),
@@ -240,8 +210,7 @@ def flash_attention_bwd_dkv_kernel(
     num_q_blocks: int,
     block_r: int,
     block_c: int,
-    causal: bool,
-    window_size: Optional[Tuple[int, int]],
+    mask_mod: Optional[MaskMod],
 ):
     """Compute dK and dV gradients."""
     k_reg = plgpu.load(k_ref.at[0, :, :])
@@ -263,18 +232,9 @@ def flash_attention_bwd_dkv_kernel(
         def compute_block(_):
             s_blk = pl.dot(q_blk, k_reg, trans_b=True, precision='float32') * qk_scale
 
-            if causal:
+            if mask_mod is not None:
                 q_idx = block_r * t + jnp.arange(block_r)
-                causal_mask = kv_idx[None, :] > q_idx[:, None]
-                s_blk = jnp.where(causal_mask, -jnp.inf, s_blk)
-            elif window_size is not None:
-                left, right = window_size
-                q_idx = block_r * t + jnp.arange(block_r)
-                mask = jnp.ones((block_r, block_c), dtype=jnp.bool_)
-                if left >= 0:
-                    mask = mask & (q_idx[:, None] - left <= kv_idx[None, :])
-                if right >= 0:
-                    mask = mask & (q_idx[:, None] + right >= kv_idx[None, :])
+                mask = mask_mod(q_idx[:, None], kv_idx[None, :])
                 s_blk = jnp.where(mask, s_blk, -jnp.inf)
 
             p_blk = jnp.exp(s_blk - logsumexp_blk[..., None])
@@ -284,18 +244,8 @@ def flash_attention_bwd_dkv_kernel(
             dk_new = dk_acc + pl.dot(ds_blk.astype(q_blk.dtype), q_blk, trans_a=True)
             return (dk_new, dv_new)
 
-        def skip_block(_):
-            return (dk_acc, dv_acc)
-
-        if causal:
-            return jax.lax.cond(t < kv_blk_idx, skip_block, compute_block, None)
-        elif window_size is not None:
-            left, right = window_size
-            skip_right = t * block_r > kv_blk_idx * block_c + (block_c - 1) + left
-            skip_left = (t + 1) * block_r - 1 < kv_blk_idx * block_c - right
-            return jax.lax.cond(skip_right | skip_left, skip_block, compute_block, None)
-        else:
-            return compute_block(None)
+        # TODO: Add block skipping optimization using BlockMask
+        return compute_block(None)
 
     dk_acc, dv_acc = jax.lax.fori_loop(0, num_q_blocks, body, (dk_acc, dv_acc))
     plgpu.store(dk_ref, dk_acc.astype(dk_ref.dtype))
@@ -315,8 +265,7 @@ def flash_attention_bwd_dkv(
     block_c: int = DEFAULT_BLOCK_C,
     num_warps: int = DEFAULT_NUM_WARPS,
     num_stages: int = DEFAULT_NUM_STAGES,
-    causal: bool = True,
-    window_size: Optional[Tuple[int, int]] = None,
+    mask_mod: Optional[MaskMod] = None,
     interpret: bool = False,
 ) -> Tuple[jax.Array, jax.Array]:
     """Compute dK and dV using pallas_call."""
@@ -332,8 +281,7 @@ def flash_attention_bwd_dkv(
             num_q_blocks=num_q_blocks,
             block_r=block_r,
             block_c=block_c,
-            causal=causal,
-            window_size=window_size,
+            mask_mod=mask_mod,
         ),
         out_shape=[
             jax.ShapeDtypeStruct(k_flat.shape, k_flat.dtype),
@@ -369,8 +317,7 @@ def flash_attention_bwd_dq_kernel(
     num_kv_blocks: int,
     block_r: int,
     block_c: int,
-    causal: bool,
-    window_size: Optional[Tuple[int, int]],
+    mask_mod: Optional[MaskMod],
 ):
     """Compute dQ gradient."""
     q_reg = plgpu.load(q_ref.at[0, :, :])
@@ -390,18 +337,9 @@ def flash_attention_bwd_dq_kernel(
         def compute_block(_):
             s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
 
-            if causal:
+            if mask_mod is not None:
                 kv_idx = block_c * t + jnp.arange(block_c)
-                causal_mask = kv_idx[None, :] > q_idx[:, None]
-                s_blk = jnp.where(causal_mask, -jnp.inf, s_blk)
-            elif window_size is not None:
-                left, right = window_size
-                kv_idx = block_c * t + jnp.arange(block_c)
-                mask = jnp.ones((block_r, block_c), dtype=jnp.bool_)
-                if left >= 0:
-                    mask = mask & (q_idx[:, None] - left <= kv_idx[None, :])
-                if right >= 0:
-                    mask = mask & (q_idx[:, None] + right >= kv_idx[None, :])
+                mask = mask_mod(q_idx[:, None], kv_idx[None, :])
                 s_blk = jnp.where(mask, s_blk, -jnp.inf)
 
             p_blk = jnp.exp(s_blk - logsumexp_reg[..., None])
@@ -410,18 +348,8 @@ def flash_attention_bwd_dq_kernel(
             dq_new = dq_acc + pl.dot(ds_blk.astype(k_blk.dtype), k_blk)
             return dq_new
 
-        def skip_block(_):
-            return dq_acc
-
-        if causal:
-            return jax.lax.cond(t > q_blk_idx, skip_block, compute_block, None)
-        elif window_size is not None:
-            left, right = window_size
-            skip_right = t * block_c > q_blk_idx * block_r + (block_r - 1) + right
-            skip_left = (t + 1) * block_c - 1 < q_blk_idx * block_r - left
-            return jax.lax.cond(skip_right | skip_left, skip_block, compute_block, None)
-        else:
-            return compute_block(None)
+        # TODO: Add block skipping optimization using BlockMask
+        return compute_block(None)
 
     dq_acc = jax.lax.fori_loop(0, num_kv_blocks, body, dq_acc)
     plgpu.store(dq_ref, dq_acc.astype(dq_ref.dtype))
@@ -440,8 +368,7 @@ def flash_attention_bwd_dq(
     block_c: int = DEFAULT_BLOCK_C,
     num_warps: int = DEFAULT_NUM_WARPS,
     num_stages: int = DEFAULT_NUM_STAGES,
-    causal: bool = True,
-    window_size: Optional[Tuple[int, int]] = None,
+    mask_mod: Optional[MaskMod] = None,
     interpret: bool = False,
 ) -> jax.Array:
     """Compute dQ using pallas_call."""
@@ -457,8 +384,7 @@ def flash_attention_bwd_dq(
             num_kv_blocks=num_kv_blocks,
             block_r=block_r,
             block_c=block_c,
-            causal=causal,
-            window_size=window_size,
+            mask_mod=mask_mod,
         ),
         out_shape=jax.ShapeDtypeStruct(q_flat.shape, q_flat.dtype),
         grid=grid,
@@ -487,8 +413,7 @@ def flash_attention_bwd(
     o: jax.Array,
     logsumexp: jax.Array,
     do: jax.Array,
-    causal: bool = True,
-    window_size: Optional[Tuple[int, int]] = None,
+    mask_mod: Optional[MaskMod] = None,
     block_r: int = DEFAULT_BLOCK_R,
     block_c: int = DEFAULT_BLOCK_C,
     num_warps: int = DEFAULT_NUM_WARPS,
@@ -517,14 +442,14 @@ def flash_attention_bwd(
     dk_flat, dv_flat = flash_attention_bwd_dkv(
         q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat,
         qk_scale, softmax_scale, block_r, block_c, num_warps, num_stages,
-        causal, window_size, interpret
+        mask_mod, interpret
     )
 
     # Kernel 3: Compute dQ
     dq_flat = flash_attention_bwd_dq(
         q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat,
         qk_scale, softmax_scale, block_r, block_c, num_warps, num_stages,
-        causal, window_size, interpret
+        mask_mod, interpret
     )
 
     return (
@@ -534,13 +459,12 @@ def flash_attention_bwd(
     )
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7, 8, 9))
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7, 8))
 def flash_attention(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    causal: bool = True,
-    window_size: Optional[Tuple[int, int]] = None,
+    mask_mod: Optional[MaskMod] = None,
     block_r: int = DEFAULT_BLOCK_R,
     block_c: int = DEFAULT_BLOCK_C,
     num_warps: int = DEFAULT_NUM_WARPS,
@@ -548,27 +472,27 @@ def flash_attention(
     interpret: bool = False,
 ) -> jax.Array:
     """Flash attention with custom backward pass."""
-    o, _ = flash_attention_fwd(q, k, v, causal, window_size, block_r, block_c, num_warps, num_stages, interpret)
+    o, _ = flash_attention_fwd(q, k, v, mask_mod, block_r, block_c, num_warps, num_stages, interpret)
     return o
 
 
 def flash_attention_fwd_rule(
-    q, k, v, causal, window_size, block_r, block_c, num_warps, num_stages, interpret
+    q, k, v, mask_mod, block_r, block_c, num_warps, num_stages, interpret
 ):
     """Forward rule for custom_vjp."""
-    o, logsumexp = flash_attention_fwd(q, k, v, causal, window_size, block_r, block_c, num_warps, num_stages, interpret)
+    o, logsumexp = flash_attention_fwd(q, k, v, mask_mod, block_r, block_c, num_warps, num_stages, interpret)
     # Only store differentiable args and outputs in residuals (not nondiff args)
     return o, (q, k, v, o, logsumexp)
 
 
-def flash_attention_bwd_rule(causal, window_size, block_r, block_c, num_warps, num_stages, interpret, res, do):
+def flash_attention_bwd_rule(mask_mod, block_r, block_c, num_warps, num_stages, interpret, res, do):
     """Backward rule for custom_vjp.
 
-    With nondiff_argnums=(3,4,5,6,7,8,9), bwd receives each nondiff arg separately.
+    With nondiff_argnums=(3,4,5,6,7,8), bwd receives each nondiff arg separately.
     """
     q, k, v, o, logsumexp = res
     dq, dk, dv = flash_attention_bwd(
-        q, k, v, o, logsumexp, do, causal, window_size,
+        q, k, v, o, logsumexp, do, mask_mod,
         block_r, block_c, num_warps, num_stages, interpret
     )
     # Return gradients for differentiable inputs only

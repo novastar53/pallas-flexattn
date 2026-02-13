@@ -4,7 +4,14 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from pallas_flexattn import flash_attention, flash_attention_fwd, mha_reference
+from pallas_flexattn import (
+    flash_attention,
+    flash_attention_fwd,
+    mha_reference,
+    causal_mask,
+    bidirectional_mask,
+    sliding_window_mask,
+)
 
 
 @pytest.fixture
@@ -37,8 +44,8 @@ class TestFlashAttentionForward:
         """Test causal flash attention matches reference implementation."""
         q, k, v = small_attn_inputs
 
-        out_flash, _ = flash_attention_fwd(q, k, v, causal=True, interpret=True)
-        out_ref = mha_reference(q, k, v, causal=True)
+        out_flash, _ = flash_attention_fwd(q, k, v, mask_mod=causal_mask, interpret=True)
+        out_ref = mha_reference(q, k, v, mask_mod=causal_mask)
 
         assert jnp.allclose(out_flash, out_ref, atol=1e-2, rtol=1e-2)
 
@@ -46,20 +53,20 @@ class TestFlashAttentionForward:
         """Test bidirectional flash attention matches reference."""
         q, k, v = small_attn_inputs
 
-        out_flash, _ = flash_attention_fwd(q, k, v, causal=False, interpret=True)
-        out_ref = mha_reference(q, k, v, causal=False)
+        out_flash, _ = flash_attention_fwd(q, k, v, mask_mod=bidirectional_mask, interpret=True)
+        out_ref = mha_reference(q, k, v, mask_mod=bidirectional_mask)
 
         assert jnp.allclose(out_flash, out_ref, atol=1e-2, rtol=1e-2)
 
     def test_sliding_window(self, small_attn_inputs):
         """Test sliding window attention."""
         q, k, v = small_attn_inputs
-        window_size = (32, 32)
+        window_mask = sliding_window_mask(32, 32)
 
         out_flash, _ = flash_attention_fwd(
-            q, k, v, causal=False, window_size=window_size, interpret=True
+            q, k, v, mask_mod=window_mask, interpret=True
         )
-        out_ref = mha_reference(q, k, v, causal=False, window_size=window_size)
+        out_ref = mha_reference(q, k, v, mask_mod=window_mask)
 
         assert jnp.allclose(out_flash, out_ref, atol=1e-2, rtol=1e-2)
 
@@ -113,11 +120,11 @@ class TestFlashAttentionBackward:
         do = jax.random.normal(jax.random.PRNGKey(1), q.shape, dtype=jnp.float32)
 
         def loss_ref(q, k, v):
-            out = mha_reference(q, k, v, causal=True)
+            out = mha_reference(q, k, v, mask_mod=causal_mask)
             return jnp.sum(out * do)
 
         def loss_flash(q, k, v):
-            out = flash_attention(q, k, v, causal=True, interpret=True)
+            out = flash_attention(q, k, v, mask_mod=causal_mask, interpret=True)
             return jnp.sum(out * do)
 
         dq_ref, dk_ref, dv_ref = jax.grad(loss_ref, argnums=(0, 1, 2))(q, k, v)
@@ -132,7 +139,7 @@ class TestFlashAttentionBackward:
         q, k, v = small_attn_inputs
 
         def loss(q, k, v):
-            out = flash_attention(q, k, v, causal=True, interpret=True)
+            out = flash_attention(q, k, v, mask_mod=causal_mask, interpret=True)
             return jnp.sum(out ** 2)
 
         # Should not raise any errors
@@ -142,10 +149,11 @@ class TestFlashAttentionBackward:
     def test_sliding_window_backward(self, small_attn_inputs):
         """Test backward pass with sliding window."""
         q, k, v = small_attn_inputs
+        window_mask = sliding_window_mask(32, 32)
 
         def loss(q, k, v):
             out = flash_attention(
-                q, k, v, causal=False, window_size=(32, 32), interpret=True
+                q, k, v, mask_mod=window_mask, interpret=True
             )
             return jnp.sum(out ** 2)
 
