@@ -138,6 +138,8 @@ def run_benchmark(
     iters: int = 20,
     skip_reference: bool = False,
     interpret: bool = False,
+    block_r: int | None = None,
+    block_c: int | None = None,
 ) -> dict:
     """Run comprehensive benchmark.
 
@@ -149,6 +151,9 @@ def run_benchmark(
         warmup: Number of warmup iterations
         iters: Number of benchmark iterations
         skip_reference: Skip reference (materialized) benchmark for long sequences
+        interpret: Use Pallas interpret mode (required for CPU)
+        block_r: Query block size (None = auto from kernel_tuner)
+        block_c: KV block size (None = auto from kernel_tuner)
 
     Returns:
         Dictionary with benchmark results
@@ -178,8 +183,10 @@ def run_benchmark(
     }
 
     # Get optimal params for our implementation
-    block_r, block_c, num_warps, num_stages = get_optimal_params(T, D)
-    print(f"Optimal kernel params: block_r={block_r}, block_c={block_c}, "
+    block_r_auto, block_c_auto, num_warps, num_stages = get_optimal_params(T, D)
+    block_r = block_r if block_r is not None else block_r_auto
+    block_c = block_c if block_c is not None else block_c_auto
+    print(f"Kernel params: block_r={block_r}, block_c={block_c}, "
           f"num_warps={num_warps}, num_stages={num_stages}")
     print()
 
@@ -374,6 +381,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Use Pallas interpret mode (required for CPU)",
     )
+    parser.add_argument(
+        "--block-r",
+        type=int,
+        default=None,
+        help="Query block size (default: auto from kernel_tuner)",
+    )
+    parser.add_argument(
+        "--block-c",
+        type=int,
+        default=None,
+        help="KV block size (default: auto from kernel_tuner)",
+    )
 
     args = parser.parse_args()
 
@@ -399,4 +418,6 @@ if __name__ == "__main__":
         iters=args.iters,
         skip_reference=args.skip_reference or args.seq_len > 1024,
         interpret=interpret,
+        block_r=args.block_r,
+        block_c=args.block_c,
     )
