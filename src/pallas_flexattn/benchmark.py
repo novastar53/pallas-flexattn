@@ -189,13 +189,13 @@ def run_benchmark(
         Dictionary with benchmark results
     """
     B, H, T, D = batch_size, num_heads, seq_len, head_dim
-    dtype = jnp.float32
+    dtype = jnp.bfloat16
     mask_mod = get_mask_mod(mask_type, window_size)
 
     print("=" * 70)
     print("Pallas FlexAttention Performance Benchmark")
     print("=" * 70)
-    print(f"Configuration: B={B}, H={H}, T={T}, D={D}, dtype={dtype}, mask={mask_type}")
+    print(f"Configuration: B={B}, H={H}, T={T}, D={D}, dtype=bfloat16, mask={mask_type}")
     print()
 
     # Generate test data
