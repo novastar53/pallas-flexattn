@@ -407,6 +407,7 @@ def flash_attention_bwd_dq(
     return dq_flat
 
 
+@partial(jax.jit, static_argnums=(6, 7, 8, 9, 10, 11))
 def flash_attention_bwd(
     q: jax.Array,
     k: jax.Array,
