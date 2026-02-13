@@ -21,6 +21,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 from pallas_flexattn.mask_mod import MaskMod, causal_mask
+from pallas_flexattn.block_mask import BlockMask
 
 # Default kernel configuration
 DEFAULT_BLOCK_R = 64
