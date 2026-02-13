@@ -19,8 +19,10 @@ from pallas_flexattn import (
     flash_attention_fwd,
     mha_reference,
     causal_mask,
+    sliding_window_mask,
 )
 from pallas_flexattn.kernel_tuner import get_optimal_params
+from pallas_flexattn.mask_mod import MaskMod
 
 
 # Optional: flash_attn_jax
@@ -129,6 +131,26 @@ def flash_attn_jax_wrapper(
     return jnp.transpose(out, (0, 2, 1, 3))
 
 
+def get_mask_mod(mask_type: str, window_size: tuple[int, int] = (64, 64)) -> MaskMod | None:
+    """Get mask mod function by type name.
+
+    Args:
+        mask_type: Type of mask ('causal', 'bidirectional', 'sliding_window')
+        window_size: Window size for sliding window mask (left, right)
+
+    Returns:
+        MaskMod function or None (None for bidirectional = no masking)
+    """
+    if mask_type == "causal":
+        return causal_mask
+    elif mask_type == "bidirectional":
+        return None  # No mask needed for full bidirectional attention
+    elif mask_type == "sliding_window":
+        return lambda q_idx, kv_idx: sliding_window_mask(q_idx, kv_idx, window_size[0], window_size[1])
+    else:
+        return None
+
+
 def run_benchmark(
     batch_size: int = 2,
     num_heads: int = 8,
@@ -140,6 +162,8 @@ def run_benchmark(
     interpret: bool = False,
     block_r: int | None = None,
     block_c: int | None = None,
+    mask_type: str = "causal",
+    window_size: tuple[int, int] = (64, 64),
 ) -> dict:
     """Run comprehensive benchmark.
 
@@ -154,17 +178,20 @@ def run_benchmark(
         interpret: Use Pallas interpret mode (required for CPU)
         block_r: Query block size (None = auto from kernel_tuner)
         block_c: KV block size (None = auto from kernel_tuner)
+        mask_type: Type of attention mask ('causal', 'bidirectional', 'sliding_window')
+        window_size: Window size tuple (left, right) for sliding_window mask
 
     Returns:
         Dictionary with benchmark results
     """
     B, H, T, D = batch_size, num_heads, seq_len, head_dim
     dtype = jnp.float32
+    mask_mod = get_mask_mod(mask_type, window_size)
 
     print("=" * 70)
     print("Pallas FlexAttention Performance Benchmark")
     print("=" * 70)
-    print(f"Configuration: B={B}, H={H}, T={T}, D={D}, dtype={dtype}")
+    print(f"Configuration: B={B}, H={H}, T={T}, D={D}, dtype={dtype}, mask={mask_type}")
     print()
 
     # Generate test data
@@ -196,7 +223,7 @@ def run_benchmark(
 
     # Reference (materialized) - skip for very long sequences
     if not skip_reference:
-        ref_fwd = jax.jit(lambda q, k, v: mha_reference(q, k, v, causal_mask))
+        ref_fwd = jax.jit(lambda q, k, v: mha_reference(q, k, v, mask_mod))
         _ = ref_fwd(q, k, v).block_until_ready()
         t_ref_fwd = benchmark(ref_fwd, q, k, v, warmup=warmup, iters=iters)
         results["forward"]["reference"] = t_ref_fwd
@@ -228,7 +255,7 @@ def run_benchmark(
     # Our Pallas implementation
     our_fwd = jax.jit(lambda q, k, v: flash_attention(
         q, k, v,
-        mask_mod=causal_mask,
+        mask_mod=mask_mod,
         block_r=block_r,
         block_c=block_c,
         num_warps=num_warps,
@@ -248,7 +275,7 @@ def run_benchmark(
     # Reference backward
     if not skip_reference:
         def loss_ref(q, k, v):
-            out = mha_reference(q, k, v, causal_mask)
+            out = mha_reference(q, k, v, mask_mod)
             return jnp.sum(out * do)
 
         grad_fn_ref = jax.grad(loss_ref, argnums=(0, 1, 2))
@@ -292,7 +319,7 @@ def run_benchmark(
     def loss_our(q, k, v):
         out = flash_attention(
             q, k, v,
-            mask_mod=causal_mask,
+            mask_mod=mask_mod,
             block_r=block_r,
             block_c=block_c,
             num_warps=num_warps,
@@ -393,6 +420,25 @@ if __name__ == "__main__":
         default=None,
         help="KV block size (default: auto from kernel_tuner)",
     )
+    parser.add_argument(
+        "--mask-type",
+        type=str,
+        default="causal",
+        choices=["causal", "bidirectional", "sliding_window"],
+        help="Type of attention mask (default: causal)",
+    )
+    parser.add_argument(
+        "--window-left",
+        type=int,
+        default=64,
+        help="Left window size for sliding_window mask (default: 64)",
+    )
+    parser.add_argument(
+        "--window-right",
+        type=int,
+        default=64,
+        help="Right window size for sliding_window mask (default: 64)",
+    )
 
     args = parser.parse_args()
 
@@ -409,6 +455,9 @@ if __name__ == "__main__":
     devices = jax.devices()
     interpret = args.interpret or (devices[0].platform == "cpu")
 
+    # Build window size tuple if using sliding_window mask
+    window_size = (args.window_left, args.window_right) if args.mask_type == "sliding_window" else (64, 64)
+
     run_benchmark(
         batch_size=args.batch_size,
         num_heads=args.num_heads,
@@ -420,4 +469,6 @@ if __name__ == "__main__":
         interpret=interpret,
         block_r=args.block_r,
         block_c=args.block_c,
+        mask_type=args.mask_type,
+        window_size=window_size,
     )

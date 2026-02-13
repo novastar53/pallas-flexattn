@@ -7,7 +7,7 @@ name = "pallas-flexattn"
 version = "0.1.0"
 description = "FlexAttention implementation in JAX/Pallas"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = "==3.12.8"
 dependencies = [
     "jax==0.8.3",
     "jaxlib==0.8.3",
