@@ -7,18 +7,18 @@ name = "pallas-flexattn"
 version = "0.1.0"
 description = "FlexAttention implementation in JAX/Pallas"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
-    "jax>=0.4.30",
-    "jaxlib>=0.4.30",
+    "jax==0.8.3",
+    "jaxlib==0.8.3",
 ]
 
 [project.optional-dependencies]
 gpu = [
-    "jax[cuda12]>=0.4.30",
+    "jax[cuda12]==0.8.3",
 ]
 tpu = [
-    "jax[tpu]>=0.4.30",
+    "jax[tpu]==0.8.3",
 ]
 dev = [
     "pytest>=8.0",
