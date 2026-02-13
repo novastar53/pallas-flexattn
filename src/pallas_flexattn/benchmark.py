@@ -162,6 +162,8 @@ def run_benchmark(
     interpret: bool = False,
     block_r: int | None = None,
     block_c: int | None = None,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
     mask_type: str = "causal",
     window_size: tuple[int, int] = (64, 64),
 ) -> dict:
@@ -178,6 +180,8 @@ def run_benchmark(
         interpret: Use Pallas interpret mode (required for CPU)
         block_r: Query block size (None = auto from kernel_tuner)
         block_c: KV block size (None = auto from kernel_tuner)
+        num_warps: Number of warps (None = auto from kernel_tuner)
+        num_stages: Number of pipeline stages (None = auto from kernel_tuner)
         mask_type: Type of attention mask ('causal', 'bidirectional', 'sliding_window')
         window_size: Window size tuple (left, right) for sliding_window mask
 
@@ -210,9 +214,11 @@ def run_benchmark(
     }
 
     # Get optimal params for our implementation
-    block_r_auto, block_c_auto, num_warps, num_stages = get_optimal_params(T, D)
+    block_r_auto, block_c_auto, num_warps_auto, num_stages_auto = get_optimal_params(T, D)
     block_r = block_r if block_r is not None else block_r_auto
     block_c = block_c if block_c is not None else block_c_auto
+    num_warps = num_warps if num_warps is not None else num_warps_auto
+    num_stages = num_stages if num_stages is not None else num_stages_auto
     print(f"Kernel params: block_r={block_r}, block_c={block_c}, "
           f"num_warps={num_warps}, num_stages={num_stages}")
     print()
@@ -421,6 +427,18 @@ if __name__ == "__main__":
         help="KV block size (default: auto from kernel_tuner)",
     )
     parser.add_argument(
+        "--num-warps",
+        type=int,
+        default=None,
+        help="Number of warps (default: auto from kernel_tuner)",
+    )
+    parser.add_argument(
+        "--num-stages",
+        type=int,
+        default=None,
+        help="Number of pipeline stages (default: auto from kernel_tuner)",
+    )
+    parser.add_argument(
         "--mask-type",
         type=str,
         default="causal",
@@ -469,6 +487,8 @@ if __name__ == "__main__":
         interpret=interpret,
         block_r=args.block_r,
         block_c=args.block_c,
+        num_warps=args.num_warps,
+        num_stages=args.num_stages,
         mask_type=args.mask_type,
         window_size=window_size,
     )
